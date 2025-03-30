@@ -1,177 +1,233 @@
 import os
-from notion_client import Client
 import requests
-from dotenv import load_dotenv
 import logging
+from notion_client import Client
+from dotenv import load_dotenv
+from openai import OpenAI  # 如果使用OpenAI摘要
 
-# 配置日志格式
+# ---------------------- 配置 ----------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("NotionAudioProcessor")
 
-# 加载环境变量
 load_dotenv()
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DATABASE_ID = os.getenv("DATABASE_ID")
 
-# 初始化Notion客户端
-notion = Client(auth=NOTION_API_KEY)
+# 环境变量校验
+REQUIRED_ENV = ["NOTION_API_KEY", "DEEPSEEK_API_KEY", "DATABASE_ID"]
+missing_env = [var for var in REQUIRED_ENV if not os.getenv(var)]
+if missing_env:
+    logger.critical(f"缺少必需的环境变量: {missing_env}")
+    exit(1)
 
-# ---------------------- 核心函数（含详细日志） ----------------------
-def get_new_audio_entries():
-    """从数据库获取待处理的音频条目"""
+# 初始化客户端
+notion = Client(auth=os.getenv("NOTION_API_KEY"), log_level=logging.WARNING)
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
+
+# ---------------------- 核心函数 ----------------------
+def validate_database_schema():
+    """验证数据库字段结构是否匹配"""
     try:
-        logger.info("正在查询数据库...")
-        query = notion.databases.query(
-            database_id=DATABASE_ID,
+        logger.info("校验数据库结构...")
+        db = notion.databases.retrieve(database_id=os.getenv("DATABASE_ID"))
+        props = db["properties"]
+        
+        required_fields = {
+            "Status": {"type": "select", "options": ["Pending", "Processed"]},
+            "Audio": {"type": "files"},
+            "Transcript": {"type": "rich_text"},
+            "Summary": {"type": "rich_text"}
+        }
+        
+        for field, config in required_fields.items():
+            if field not in props:
+                raise ValueError(f"缺少必需字段: {field}")
+            if props[field]["type"] != config["type"]:
+                raise ValueError(f"字段 '{field}' 类型应为 {config['type']}, 实际是 {props[field]['type']}")
+            if config.get("options") and not any(opt["name"] in config["options"] for opt in props[field]["select"]["options"]):
+                raise ValueError(f"字段 '{field}' 缺少必需选项: {config['options']}")
+        
+        logger.info("数据库结构校验通过")
+        return True
+    except Exception as e:
+        logger.critical(f"数据库结构不兼容: {str(e)}")
+        return False
+
+def get_pending_entries():
+    """获取待处理的Notion条目"""
+    try:
+        logger.info("查询待处理条目...")
+        response = notion.databases.query(
+            database_id=os.getenv("DATABASE_ID"),
             filter={
                 "property": "Status",
                 "select": {"equals": "Pending"}
             }
         )
-        entries = query.get("results", [])
-        logger.info(f"找到 {len(entries)} 条待处理记录")
+        entries = response.get("results", [])
+        logger.info(f"找到 {len(entries)} 个待处理条目")
         return entries
     except Exception as e:
-        logger.error(f"数据库查询失败: {str(e)}")
+        logger.error(f"查询数据库失败: {str(e)}")
         return []
 
-def transcribe_audio(audio_url):
-    """调用DeepSeek API转文本"""
+def download_audio(audio_url):
+    """下载音频文件并验证"""
     try:
-        logger.info(f"开始转录音频，URL: {audio_url}")
+        logger.info(f"下载音频文件: {audio_url}")
+        response = requests.get(audio_url, timeout=10)
+        response.raise_for_status()
         
-        # 下载音频文件
-        response = requests.get(audio_url)
-        if response.status_code != 200:
-            logger.error(f"音频下载失败，HTTP状态码: {response.status_code}")
-            return ""
-        
-        # 调用DeepSeek API
-        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
-        api_response = requests.post(
+        if len(response.content) == 0:
+            logger.error("音频文件内容为空")
+            return None
+            
+        return response.content
+    except Exception as e:
+        logger.error(f"音频下载失败: {str(e)}")
+        return None
+
+def transcribe_with_deepseek(audio_data):
+    """调用DeepSeek API进行转录"""
+    try:
+        logger.info("调用DeepSeek API进行转录...")
+        headers = {
+            "Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}",
+            "Content-Type": "multipart/form-data"
+        }
+        response = requests.post(
             "https://api.deepseek.com/v1/audio/transcriptions",
             headers=headers,
-            files={"file": response.content},
-            data={"model": "whisper-1"}
+            files={"file": ("audio.mp3", audio_data)},
+            data={"model": "whisper-1"},
+            timeout=30
         )
+        response.raise_for_status()
         
-        # 检查API响应
-        if api_response.status_code != 200:
-            logger.error(f"DeepSeek API调用失败，状态码: {api_response.status_code}")
-            logger.error(f"响应内容: {api_response.text}")
-            return ""
-        
-        text = api_response.json().get("text", "")
-        logger.info(f"转录成功，内容长度: {len(text)} 字符")
-        return text
+        transcript = response.json().get("text", "")
+        logger.info(f"转录成功，字符数: {len(transcript)}")
+        return transcript
     except Exception as e:
-        logger.error(f"转录过程中发生异常: {str(e)}")
+        logger.error(f"转录失败: {str(e)}")
+        if response:
+            logger.debug(f"API响应: {response.text}")
         return ""
 
 def generate_summary(text):
-    """生成摘要"""
-    try:
-        if not text:
-            logger.warning("输入文本为空，跳过摘要生成")
-            return ""
-            
-        logger.info("正在生成摘要...")
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    """生成摘要（使用OpenAI）"""
+    if not text or not openai_client:
+        return ""
         
-        response = client.chat.completions.create(
+    try:
+        logger.info("生成内容摘要...")
+        response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{
                 "role": "user",
-                "content": f"请用中文总结以下内容，保留关键信息：\n{text}"
-            }]
+                "content": f"用简洁的中文总结以下内容，保留关键信息：\n{text}"
+            }],
+            temperature=0.5,
+            max_tokens=300
         )
-        
         summary = response.choices[0].message.content
-        logger.info(f"摘要生成成功，内容长度: {len(summary)} 字符")
+        logger.info(f"摘要生成成功，字符数: {len(summary)}")
         return summary
     except Exception as e:
         logger.error(f"摘要生成失败: {str(e)}")
         return ""
 
-def update_notion_page(page_id, text, summary):
+def update_notion_page(page_id, transcript, summary):
     """更新Notion页面"""
     try:
-        logger.info(f"准备更新页面 {page_id}...")
+        logger.info(f"更新页面 {page_id}...")
         
-        # 构建属性对象
+        # 构建符合Notion API要求的属性结构
         properties = {
             "Status": {"select": {"name": "Processed"}},
             "Transcript": {
                 "rich_text": [{
                     "type": "text",
-                    "text": {"content": text}
+                    "text": {"content": transcript},
+                    "annotations": {"bold": False, "italic": False, "code": False},
+                    "plain_text": transcript
                 }]
             },
             "Summary": {
                 "rich_text": [{
                     "type": "text",
-                    "text": {"content": summary}
+                    "text": {"content": summary},
+                    "annotations": {"bold": False, "italic": False, "code": False},
+                    "plain_text": summary
                 }]
             }
         }
         
-        # 调试输出属性结构
-        logger.debug("更新属性结构: %s", properties)
+        # 调试输出
+        logger.debug("更新属性: %s", properties)
         
-        # 执行更新
-        notion.pages.update(
+        response = notion.pages.update(
             page_id=page_id,
             properties=properties
         )
+        
+        # 验证更新结果
+        if response["properties"]["Status"]["select"]["name"] != "Processed":
+            raise ValueError("状态更新失败")
+            
         logger.info("页面更新成功")
+        return True
     except Exception as e:
-        logger.error(f"页面更新失败: {str(e)}")
+        logger.error(f"更新失败: {str(e)}")
+        logger.debug("错误详情: %s", response if 'response' in locals() else "")
+        return False
 
 # ---------------------- 主流程 ----------------------
 def main():
-    try:
-        logger.info("========== 开始处理流程 ==========")
+    logger.info("======== 开始处理流程 ========")
+    
+    # 前置校验
+    if not validate_database_schema():
+        logger.error("数据库结构校验失败，终止运行")
+        return
+    
+    entries = get_pending_entries()
+    if not entries:
+        logger.info("没有需要处理的条目")
+        return
+    
+    for entry in entries:
+        logger.info(f"处理条目: {entry['id']}")
         
-        # 步骤1：获取待处理条目
-        entries = get_new_audio_entries()
-        if not entries:
-            logger.warning("没有需要处理的条目")
-            return
+        # 获取音频文件
+        try:
+            file_prop = entry["properties"]["Audio"]["files"][0]
+            audio_url = file_prop["file"]["url"]
+        except (KeyError, IndexError) as e:
+            logger.error(f"音频URL解析失败: {str(e)}")
+            logger.debug("原始Audio属性: %s", entry["properties"]["Audio"])
+            continue
             
-        # 步骤2：处理每个条目
-        for idx, entry in enumerate(entries):
-            logger.info(f"处理第 {idx+1}/{len(entries)} 个条目")
+        # 下载音频
+        audio_data = download_audio(audio_url)
+        if not audio_data:
+            continue
             
-            # 获取音频URL
-            try:
-                audio_data = entry["properties"]["Audio"]["files"][0]
-                audio_url = audio_data["file"]["url"]
-                logger.info(f"解析到音频URL: {audio_url}")
-            except (KeyError, IndexError) as e:
-                logger.error("音频URL解析失败，请检查数据库字段结构")
-                logger.error(f"原始数据: {entry['properties']['Audio']}")
-                continue
-                
-            # 转录音频
-            text = transcribe_audio(audio_url)
-            if not text:
-                logger.error("转录失败，跳过后续处理")
-                continue
-                
-            # 生成摘要
-            summary = generate_summary(text)
+        # 转录音频
+        transcript = transcribe_with_deepseek(audio_data)
+        if not transcript:
+            logger.error("跳过无转录结果的条目")
+            continue
             
-            # 更新页面
-            update_notion_page(entry["id"], text, summary)
+        # 生成摘要
+        summary = generate_summary(transcript)
+        
+        # 更新Notion
+        success = update_notion_page(entry["id"], transcript, summary)
+        if not success:
+            logger.error("条目处理失败，保留Pending状态")
             
-        logger.info("========== 处理完成 ==========")
-    except Exception as e:
-        logger.error(f"主流程发生未捕获的异常: {str(e)}")
+    logger.info("======== 处理完成 ========")
 
 if __name__ == "__main__":
     main()
