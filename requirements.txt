@@ -1,0 +1,4 @@
+notion-client
+requests
+python-dotenv
+openai  # 如需使用OpenAI摘要
